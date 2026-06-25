@@ -3612,6 +3612,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def compress_messages(request: Request):
         return await proxy.handle_compress(request)
 
+    @app.post("/v1/responses/compress")
+    async def compress_openai_responses(request: Request):
+        return await proxy.handle_openai_responses_compress(request)
+
     register_provider_routes(app, proxy)
 
     return app

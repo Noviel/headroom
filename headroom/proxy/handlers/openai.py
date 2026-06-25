@@ -678,6 +678,7 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         pass_id: str | None = None,
+        target_ratio_override: float | None = None,
         timing: dict[str, float] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
@@ -730,6 +731,12 @@ class OpenAIHandlerMixin:
         unit_target_ratio = profile_kwargs.get("target_ratio")
         if unit_target_ratio is not None:
             unit_target_ratio = float(unit_target_ratio)
+        if target_ratio_override is not None:
+            unit_target_ratio = (
+                float(target_ratio_override)
+                if unit_target_ratio is None
+                else min(unit_target_ratio, float(target_ratio_override))
+            )
 
         try:
             tokenizer = self.openai_provider.get_token_counter(model)
@@ -1210,6 +1217,7 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
+        token_budget: int | None = None,
         timing: dict[str, float] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
@@ -1230,6 +1238,21 @@ class OpenAIHandlerMixin:
         input_serialization_started = time.perf_counter()
         input_bytes = json.dumps(payload).encode("utf-8")
         _add_timing("compression_input_json_dump", input_serialization_started)
+        target_ratio_override: float | None = None
+        if token_budget is not None:
+            try:
+                tokenizer = self.openai_provider.get_token_counter(model)
+                estimated_input_tokens = tokenizer.count_text(input_bytes.decode("utf-8"))
+                if estimated_input_tokens > token_budget > 0:
+                    target_ratio_override = max(
+                        0.05,
+                        min(1.0, float(token_budget) / float(estimated_input_tokens)),
+                    )
+            except Exception:
+                logger.debug(
+                    "[%s] OpenAI Responses token_budget estimation unavailable",
+                    request_id,
+                )
         # Codex/Responses requests can re-enter this method many times per
         # request_id (one per turn over the same websocket). Tag every
         # event in this single pass with a content-derived id so dashboards
@@ -1310,6 +1333,7 @@ class OpenAIHandlerMixin:
             model=model,
             request_id=request_id,
             pass_id=pass_id,
+            target_ratio_override=target_ratio_override,
             timing=timing_sink,
         )
         _add_timing("compression_live_units_total", live_units_started)
@@ -1431,6 +1455,7 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
+        token_budget: int | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
@@ -1440,10 +1465,11 @@ class OpenAIHandlerMixin:
                     payload,
                     model=model,
                     request_id=request_id,
+                    token_budget=token_budget,
                     timing=timing,
                 )
             except TypeError as exc:
-                if "unexpected keyword argument 'timing'" not in str(exc):
+                if "unexpected keyword argument" not in str(exc):
                     raise
                 return self._compress_openai_responses_payload(
                     payload,
@@ -1458,6 +1484,113 @@ class OpenAIHandlerMixin:
         if len(result) == 8:
             return (*result, timing)
         return result
+
+    async def handle_openai_responses_compress(self, request: Request) -> JSONResponse:
+        """Compress an OpenAI Responses API payload without calling upstream."""
+
+        from fastapi.responses import JSONResponse
+
+        from headroom.proxy.helpers import _read_request_json
+
+        try:
+            body = await _read_request_json(request)
+        except Exception:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "type": "invalid_request",
+                        "message": "Invalid JSON in request body.",
+                    }
+                },
+            )
+
+        responses_request = body.get("request")
+        if not isinstance(responses_request, dict):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "type": "invalid_request",
+                        "message": "Missing required object field: request",
+                    }
+                },
+            )
+
+        model = body.get("model", responses_request.get("model"))
+        if not isinstance(model, str) or not model:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "type": "invalid_request",
+                        "message": "Missing required field: model",
+                    }
+                },
+            )
+
+        token_budget_raw = body.get("token_budget")
+        token_budget: int | None = None
+        if token_budget_raw is not None:
+            if not isinstance(token_budget_raw, int) or token_budget_raw <= 0:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "invalid_request",
+                            "message": "token_budget must be a positive integer",
+                        }
+                    },
+                )
+            token_budget = token_budget_raw
+
+        try:
+            request_id = await self._next_request_id()
+            (
+                compressed_request,
+                modified,
+                tokens_saved,
+                transforms,
+                reason,
+                input_bytes,
+                output_bytes,
+                attempted_tokens,
+                _timing,
+            ) = await self._compress_openai_responses_payload_in_executor(
+                responses_request,
+                model=model,
+                request_id=request_id,
+                token_budget=token_budget,
+            )
+            tokens_before = max(0, int(attempted_tokens))
+            tokens_after = max(0, tokens_before - max(0, int(tokens_saved)))
+            return JSONResponse(
+                {
+                    "request": compressed_request,
+                    "tokens_before": tokens_before,
+                    "tokens_after": tokens_after,
+                    "tokens_saved": max(0, int(tokens_saved)),
+                    "compression_ratio": (
+                        tokens_after / tokens_before if tokens_before > 0 else 1.0
+                    ),
+                    "transforms_applied": transforms,
+                    "modified": modified,
+                    "reason": reason,
+                    "bytes_before": input_bytes,
+                    "bytes_after": output_bytes,
+                }
+            )
+        except Exception as e:
+            logger.exception("Responses compression failed: %s", e)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "type": "compression_error",
+                        "message": str(e),
+                    }
+                },
+            )
 
     async def handle_openai_chat(
         self,

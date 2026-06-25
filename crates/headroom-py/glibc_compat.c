@@ -6,6 +6,7 @@
  * Currently shimmed:
  *   - C23 strtol* family (`__isoc23_*`, glibc 2.38+) — see Section A
  *   - `__libc_single_threaded` (glibc 2.32+) — see Section B
+ *   - `std::__throw_bad_array_new_length` (libstdc++ gcc 11+) — see Section C
  *
  * ============================================================
  * Section A: C23 strtol* family — glibc 2.38+
@@ -168,3 +169,34 @@ unsigned long long __isoc23_strtoull(const char *nptr, char **endptr, int base) 
  *   (`Single-threaded stdio optimization`)
  */
 char __libc_single_threaded = 0;
+
+/*
+ * ============================================================
+ * Section C: libstdc++ gcc 11+ helpers
+ * ============================================================
+ *
+ * Some statically linked C++ dependencies reference the libstdc++ helper
+ * `_ZSt28__throw_bad_array_new_lengthv`. Ubuntu 20.04's libstdc++ (gcc 10)
+ * does not export it, so importing `headroom._core` fails before Python can
+ * start the proxy.
+ *
+ * This path should only execute for impossible/invalid array allocations.
+ * For the runtime compatibility goal, an aborting fallback is enough: it makes
+ * the extension importable on old libstdc++ while preserving fail-closed
+ * behavior if the exceptional allocation path is ever actually reached.
+ */
+extern void abort(void);
+
+void _ZSt28__throw_bad_array_new_lengthv(void) {
+    abort();
+}
+
+/*
+ * GCC 11 also exports the C++20 no-argument std::string::reserve() symbol.
+ * Ubuntu 20.04's libstdc++ lacks that symbol. The no-argument overload is a
+ * non-binding shrink request; treating it as a no-op is safe for import/runtime
+ * compatibility and matches the behavior callers must already tolerate.
+ */
+void _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE7reserveEv(void *self) {
+    (void)self;
+}

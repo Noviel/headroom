@@ -480,6 +480,10 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def openai_responses(request: Request):
         return await proxy.handle_openai_responses(request)
 
+    @app.post("/v1/responses/compress")
+    async def openai_responses_compress(request: Request):
+        return await proxy.handle_openai_responses_compress(request)
+
     @app.post("/v1/codex/responses")
     async def openai_v1_codex_responses(request: Request):
         return await proxy.handle_openai_responses(request)

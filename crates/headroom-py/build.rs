@@ -7,6 +7,8 @@
 //   - `__libc_single_threaded` introduced in glibc 2.32 — see
 //     `glibc_compat.c` Section B (caught by X1 smoke gate on PR
 //     #396 X2 dry-run; latent since the ORT artifact bump).
+//   - libstdc++ gcc 11+ helper symbols missing from Ubuntu 20.04
+//     libstdc++ — see `glibc_compat.c` Section C.
 //
 // Static dependencies in `_core.so` (notably the prebuilt ONNX
 // Runtime artifacts compiled with gcc 14.x) reference all of these,
@@ -71,6 +73,9 @@ fn main() {
         // the .so ships with a UND `__libc_single_threaded` that
         // breaks import on glibc < 2.32.
         "__libc_single_threaded",
+        // libstdc++ gcc 11+ — see glibc_compat.c Section C.
+        "_ZSt28__throw_bad_array_new_lengthv",
+        "_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE7reserveEv",
     ] {
         println!("cargo:rustc-link-arg=-Wl,-u,{sym}");
     }
