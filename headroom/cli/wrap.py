@@ -43,6 +43,7 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 
 import click
 
+from headroom import fsutil
 from headroom._version import __version__ as _HEADROOM_VERSION
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
@@ -128,19 +129,18 @@ from .main import main
 
 
 def _read_text(path: Path) -> str:
-    """Read a text file with explicit UTF-8 encoding."""
-    return path.read_text(encoding="utf-8")
+    """Read a text file as UTF-8, falling back to the system locale encoding."""
+    return fsutil.read_text(path)
 
 
 def _write_text(path: Path, content: str) -> None:
-    """Write a text file with explicit UTF-8 encoding."""
-    path.write_text(content, encoding="utf-8")
+    """Write a text file as UTF-8 without translating line endings (preserves CRLF)."""
+    fsutil.write_text(path, content)
 
 
 def _append_text(path: Path, content: str) -> None:
-    """Append to a text file with explicit UTF-8 encoding."""
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(content)
+    """Append to a text file as UTF-8 without translating line endings."""
+    fsutil.append_text(path, content)
 
 
 _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
@@ -556,7 +556,7 @@ def _patch_rtk_hook_absolute_path(rtk_path: Path, hook_script_path: Path | None 
     if not hook_script_path.exists():
         return False
 
-    original = hook_script_path.read_text()
+    original = _read_text(hook_script_path)
 
     # Quote the absolute path safely for POSIX shells. This matters because
     # paths containing spaces or other shell-special characters (e.g.
@@ -576,7 +576,7 @@ def _patch_rtk_hook_absolute_path(rtk_path: Path, hook_script_path: Path | None 
     )
 
     if count and patched != original:
-        hook_script_path.write_text(patched)
+        _write_text(hook_script_path, patched)
         return True
 
     return False
@@ -2608,15 +2608,100 @@ def _ensure_proxy(
                         f"Persistent deployment '{manifest.profile}' on port {port} "
                         f"is running stale Headroom {running_version} and could not be restarted."
                     )
-                click.echo(f"  Proxy already running on port {port}")
-                click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
-                return None
-            if helpers._recover_persistent_proxy(port):
-                return None
-            if helpers._check_proxy(port):
-                raise click.ClickException(
-                    f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
-                )
+                # Check if the running proxy has the features we need.
+                # Without this, a persistent deployment started for one use case
+                # (e.g. --backend anthropic) would be silently reused for another
+                # (e.g. --subscription --provider-type openai) causing auth failures.
+                running_config = helpers._proxy_health_config(health_payload)
+                if running_config is None:
+                    running_config = helpers._query_proxy_config(port)
+                if running_config is not None:
+                    missing = []
+                    if memory and not running_config.get("memory"):
+                        missing.append("memory")
+                    if learn and not running_config.get("learn"):
+                        missing.append("learn")
+                    if code_graph and not running_config.get("code_graph"):
+                        missing.append("code_graph")
+                    if openai_api_url:
+                        running_openai_url = _normalize_proxy_api_url(
+                            running_config.get("openai_api_url")
+                        )
+                        requested_openai_url = _normalize_proxy_api_url(openai_api_url)
+                        if running_openai_url != requested_openai_url:
+                            missing.append("openai-api-url")
+                    if not missing:
+                        click.echo(f"  Proxy already running on port {port}")
+                        click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                        return None
+                # Features mismatch or config unavailable — fall through to
+                # the non-persistent path which handles proxy restart.
+            else:
+                if helpers._recover_persistent_proxy(port):
+                    # If the caller requested feature-sensitive config (e.g.
+                    # openai_api_url for Copilot subscription), continue into
+                    # the shared running-proxy checks below so mismatch-driven
+                    # restart logic can run. For plain recover-only calls,
+                    # preserve the historical fast return.
+                    if not any((memory, learn, code_graph, openai_api_url)):
+                        return None
+                    if not helpers._check_proxy(port):
+                        return None
+
+                    # A freshly recovered persistent proxy may not expose
+                    # a full config payload yet. In feature-sensitive flows
+                    # (e.g. Copilot subscription), treat missing or mismatched
+                    # config as restart-required and refresh the persistent
+                    # deployment directly instead of silently reusing it.
+                    health_payload = helpers._query_proxy_health(port)
+                    running_config = helpers._proxy_health_config(health_payload)
+                    if running_config is None:
+                        running_config = helpers._query_proxy_config(port)
+
+                    if running_config is None:
+                        click.echo(
+                            f"  Recovered persistent deployment '{manifest.profile}' "
+                            "did not expose config; restarting with requested features..."
+                        )
+                        if helpers._restart_persistent_proxy(manifest, port):
+                            return None
+                        raise click.ClickException(
+                            f"Persistent deployment '{manifest.profile}' on port {port} "
+                            "could not be restarted after recovery."
+                        )
+
+                    missing = []
+                    if memory and not running_config.get("memory"):
+                        missing.append("memory")
+                    if learn and not running_config.get("learn"):
+                        missing.append("learn")
+                    if code_graph and not running_config.get("code_graph"):
+                        missing.append("code-graph")
+                    if openai_api_url:
+                        running_openai_url = _normalize_proxy_api_url(
+                            running_config.get("openai_api_url")
+                        )
+                        requested_openai_url = _normalize_proxy_api_url(openai_api_url)
+                        if running_openai_url != requested_openai_url:
+                            missing.append("openai-api-url")
+
+                    if missing:
+                        flags_str = ", ".join(f"--{f}" for f in missing)
+                        click.echo(
+                            f"  Recovered persistent deployment '{manifest.profile}' is missing: "
+                            f"{flags_str}; restarting..."
+                        )
+                        if helpers._restart_persistent_proxy(manifest, port):
+                            return None
+                        raise click.ClickException(
+                            f"Persistent deployment '{manifest.profile}' on port {port} "
+                            "could not be restarted with requested features."
+                        )
+                    return None
+                elif helpers._check_proxy(port):
+                    raise click.ClickException(
+                        f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
+                    )
             click.echo(
                 f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
                 "is stale; starting a fresh proxy instead."
